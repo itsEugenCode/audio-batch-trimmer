@@ -203,44 +203,126 @@ enum TrimmerError: Error, LocalizedError {
 }
 
 class AudioTrimmerEngine: AudioTrimmerProtocol {
+    /// When set (selected folder), debug NDJSON is also written there — sandbox-safe.
+    var logDirectory: URL?
+
+    // #region agent log
+    private func debugLog(hypothesisId: String, location: String, message: String, data: [String: Any]) {
+        let primaryPath = "/Users/eugen/Documents/projects/audio-batch-trimmer/.cursor/debug-0363d2.log"
+        let payload: [String: Any] = [
+            "sessionId": "0363d2",
+            "runId": "post-fix",
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+            "data": data
+        ]
+        guard let json = try? JSONSerialization.data(withJSONObject: payload),
+              let line = String(data: json, encoding: .utf8) else { return }
+        let entry = line + "\n"
+        func append(to path: String) {
+            let url = URL(fileURLWithPath: path)
+            if FileManager.default.fileExists(atPath: path),
+               let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                if let d = entry.data(using: .utf8) { try? handle.write(contentsOf: d) }
+            } else {
+                try? entry.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+        append(to: primaryPath)
+        if let dir = logDirectory {
+            append(to: dir.appendingPathComponent("debug-0363d2.log").path)
+        }
+        NSLog("[debug-0363d2] %@ | %@", location, message)
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:7439/ingest/595a876c-8b20-446e-9270-a575c9b2085a")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("0363d2", forHTTPHeaderField: "X-Debug-Session-Id")
+        request.httpBody = json
+        URLSession.shared.dataTask(with: request).resume()
+    }
+    // #endregion
+
     func trim(audioFile: AudioFile, settings: TrimSettings, outputURL: URL) async throws {
         let endSeconds = Double(settings.secondsToKeep)
         let fadeSeconds = Double(settings.fadeDuration)
+        let sourceName = audioFile.fileName
+        let sourceURL = audioFile.url
         
-        // Создаём выходной файл M4A (AAC)
-        let outputSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 44100.0,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 192000
-        ]
-        
-        let audioFile = try AVAudioFile(forReading: audioFile.url)
-        let format = audioFile.processingFormat
+        let inputFile = try AVAudioFile(forReading: sourceURL)
+        let format = inputFile.processingFormat
+        let fileFormat = inputFile.fileFormat
         let sampleRate = format.sampleRate
+        let channelCount = format.channelCount
         
-        // Вычисляем количество кадров для обрезки
-        let totalFrames = AVAudioFrameCount(audioFile.length)
+        // Output sample rate/channels must match source PCM, otherwise
+        // frames are played at the wrong speed (e.g. 48k labeled as 44.1k).
+        // AAC rejects high bitrates at low sample rates (e.g. 192k @ 22.05k).
+        var outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: channelCount
+        ]
+        let bitRate: Int
+        if sampleRate >= 44100 {
+            bitRate = 192_000
+            outputSettings[AVEncoderBitRateKey] = bitRate
+        } else if sampleRate >= 32000 {
+            bitRate = 128_000
+            outputSettings[AVEncoderBitRateKey] = bitRate
+        } else {
+            // Let the encoder pick a valid rate for low sample rates
+            bitRate = 0
+        }
+        
+        let totalFrames = AVAudioFrameCount(inputFile.length)
         let keepFrames = AVAudioFrameCount(endSeconds * sampleRate)
         let framesToRead = min(totalFrames, keepFrames)
         
+        // #region agent log
+        debugLog(
+            hypothesisId: "A",
+            location: "AudioTrimmerEngine.trim:preWrite",
+            message: "output settings matched to source processing format",
+            data: [
+                "file": sourceName,
+                "secondsToKeep": endSeconds,
+                "fadeSeconds": fadeSeconds,
+                "processingSampleRate": sampleRate,
+                "fileFormatSampleRate": fileFormat.sampleRate,
+                "processingChannels": channelCount,
+                "fileFormatChannels": fileFormat.channelCount,
+                "outputSampleRate": sampleRate,
+                "outputChannels": channelCount,
+                "outputBitRate": bitRate,
+                "totalFrames": totalFrames,
+                "keepFrames": keepFrames,
+                "framesToRead": framesToRead,
+                "expectedDurationSec": Double(framesToRead) / sampleRate
+            ]
+        )
+        // #endregion
+        
         guard framesToRead > 0 else { throw TrimmerError.exportFailed }
         
-        // Создаём буфер для обрезанных данных
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: framesToRead) else {
             throw TrimmerError.exportFailed
         }
         
-        // Читаем только нужное количество кадров
-        try audioFile.read(into: buffer, frameCount: framesToRead)
+        try inputFile.read(into: buffer, frameCount: framesToRead)
         
-        // Применяем затухание если указано
+        var fadeFramesApplied: AVAudioFrameCount = 0
+        var startFadeFrameApplied: AVAudioFrameCount = 0
         if fadeSeconds > 0 {
             let fadeFrames = AVAudioFrameCount(fadeSeconds * sampleRate)
             let startFadeFrame = max(0, buffer.frameLength - fadeFrames)
+            fadeFramesApplied = fadeFrames
+            startFadeFrameApplied = startFadeFrame
             
-            let channelCount = Int(format.channelCount)
-            for channel in 0..<channelCount {
+            for channel in 0..<Int(channelCount) {
                 guard let channelData = buffer.floatChannelData?[channel] else { continue }
                 
                 for frame in Int(startFadeFrame)..<Int(buffer.frameLength) {
@@ -251,9 +333,115 @@ class AudioTrimmerEngine: AudioTrimmerProtocol {
             }
         }
         
-        // Создаём выходной M4A файл
-        let outputFile = try AVAudioFile(forWriting: outputURL, settings: outputSettings)
-        try outputFile.write(from: buffer)
+        // #region agent log
+        debugLog(
+            hypothesisId: "E",
+            location: "AudioTrimmerEngine.trim:postFade",
+            message: "buffer length after fade (fade must not extend frames)",
+            data: [
+                "file": sourceName,
+                "bufferFrameLength": buffer.frameLength,
+                "bufferFrameCapacity": buffer.frameCapacity,
+                "fadeFramesApplied": fadeFramesApplied,
+                "startFadeFrame": startFadeFrameApplied,
+                "bufferExtendedByFade": buffer.frameLength > framesToRead
+            ]
+        )
+        // #endregion
+        
+        let outputFile: AVAudioFile
+        do {
+            outputFile = try AVAudioFile(forWriting: outputURL, settings: outputSettings)
+        } catch {
+            // #region agent log
+            debugLog(
+                hypothesisId: "F",
+                location: "AudioTrimmerEngine.trim:createOutputFailed",
+                message: "AVAudioFile forWriting failed",
+                data: [
+                    "file": sourceName,
+                    "error": String(describing: error),
+                    "sampleRate": sampleRate,
+                    "channels": channelCount,
+                    "bitRate": bitRate
+                ]
+            )
+            // #endregion
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        }
+        let writeBuffer: AVAudioPCMBuffer
+        if buffer.format.sampleRate == outputFile.processingFormat.sampleRate &&
+            buffer.format.channelCount == outputFile.processingFormat.channelCount &&
+            buffer.format.commonFormat == outputFile.processingFormat.commonFormat {
+            writeBuffer = buffer
+        } else {
+            guard let converter = AVAudioConverter(from: buffer.format, to: outputFile.processingFormat) else {
+                throw TrimmerError.exportFailed
+            }
+            let ratio = outputFile.processingFormat.sampleRate / buffer.format.sampleRate
+            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+            guard let converted = AVAudioPCMBuffer(pcmFormat: outputFile.processingFormat, frameCapacity: capacity) else {
+                throw TrimmerError.exportFailed
+            }
+            var convertError: NSError?
+            var inputConsumed = false
+            let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+                if inputConsumed {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                inputConsumed = true
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            converter.convert(to: converted, error: &convertError, withInputFrom: inputBlock)
+            if let convertError {
+                // #region agent log
+                debugLog(
+                    hypothesisId: "F",
+                    location: "AudioTrimmerEngine.trim:convertFailed",
+                    message: "AVAudioConverter failed",
+                    data: ["file": sourceName, "error": convertError.localizedDescription]
+                )
+                // #endregion
+                try? FileManager.default.removeItem(at: outputURL)
+                throw convertError
+            }
+            writeBuffer = converted
+        }
+        
+        // #region agent log
+        debugLog(
+            hypothesisId: "C",
+            location: "AudioTrimmerEngine.trim:writeFormats",
+            message: "writing buffer matched to output processing format",
+            data: [
+                "file": sourceName,
+                "bufferSampleRate": writeBuffer.format.sampleRate,
+                "bufferChannels": writeBuffer.format.channelCount,
+                "outputProcessingSampleRate": outputFile.processingFormat.sampleRate,
+                "outputProcessingChannels": outputFile.processingFormat.channelCount,
+                "outputFileSampleRate": outputFile.fileFormat.sampleRate,
+                "formatsEqual": writeBuffer.format.sampleRate == outputFile.processingFormat.sampleRate &&
+                    writeBuffer.format.channelCount == outputFile.processingFormat.channelCount
+            ]
+        )
+        // #endregion
+        do {
+            try outputFile.write(from: writeBuffer)
+        } catch {
+            // #region agent log
+            debugLog(
+                hypothesisId: "F",
+                location: "AudioTrimmerEngine.trim:writeFailed",
+                message: "write from buffer failed",
+                data: ["file": sourceName, "error": String(describing: error)]
+            )
+            // #endregion
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        }
     }
 }
 
@@ -383,6 +571,7 @@ class MainViewModel: ObservableObject {
 
         // Сохраняем в формате M4A (AAC), который нативно поддерживает AVFoundation
         let outputURL = namingService.generateUniqueName(originalURL: file.url, in: folder, preferredExtension: "m4a")
+        trimmer.logDirectory = folder
 
         do {
             try await trimmer.trim(audioFile: file, settings: trimSettings, outputURL: outputURL)
@@ -391,6 +580,55 @@ class MainViewModel: ObservableObject {
             let duration = try await asset.load(.duration)
             let newDuration = CMTimeGetSeconds(duration)
 
+            // #region agent log
+            trimmer.logDirectory = folder
+            let expected = Double(trimSettings.secondsToKeep)
+            let delta = newDuration - expected
+            // Reuse engine logger via a small local write to both paths
+            let path = "/Users/eugen/Documents/projects/audio-batch-trimmer/.cursor/debug-0363d2.log"
+            let folderLog = folder.appendingPathComponent("debug-0363d2.log").path
+            let payload: [String: Any] = [
+                "sessionId": "0363d2",
+                "runId": "post-fix",
+                "hypothesisId": "A",
+                "location": "MainViewModel.processFile:postTrim",
+                "message": "actual output duration vs requested keep",
+                "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+                "data": [
+                    "file": file.fileName,
+                    "sourceDuration": file.duration,
+                    "secondsToKeep": expected,
+                    "fadeDuration": trimSettings.fadeDuration,
+                    "outputDuration": newDuration,
+                    "deltaFromKeep": delta,
+                    "durationOk": abs(delta) < 0.25,
+                    "outputURL": outputURL.lastPathComponent
+                ] as [String: Any]
+            ]
+            if let json = try? JSONSerialization.data(withJSONObject: payload),
+               let line = String(data: json, encoding: .utf8) {
+                let entry = line + "\n"
+                for p in [path, folderLog] {
+                    let url = URL(fileURLWithPath: p)
+                    if FileManager.default.fileExists(atPath: p),
+                       let handle = try? FileHandle(forWritingTo: url) {
+                        defer { try? handle.close() }
+                        try? handle.seekToEnd()
+                        if let d = entry.data(using: .utf8) { try? handle.write(contentsOf: d) }
+                    } else {
+                        try? entry.write(to: url, atomically: true, encoding: .utf8)
+                    }
+                }
+                NSLog("[debug-0363d2] postTrim %@ duration=%.3f delta=%.3f ok=%@", file.fileName, newDuration, delta, abs(delta) < 0.25 ? "YES" : "NO")
+                var request = URLRequest(url: URL(string: "http://127.0.0.1:7439/ingest/595a876c-8b20-446e-9270-a575c9b2085a")!)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("0363d2", forHTTPHeaderField: "X-Debug-Session-Id")
+                request.httpBody = json
+                URLSession.shared.dataTask(with: request).resume()
+            }
+            // #endregion
+
             return TrimResult(
                 success: true,
                 originalFile: file,
@@ -398,6 +636,39 @@ class MainViewModel: ObservableObject {
                 newDuration: newDuration
             )
         } catch {
+            // #region agent log
+            let path = "/Users/eugen/Documents/projects/audio-batch-trimmer/.cursor/debug-0363d2.log"
+            let folderLog = folder.appendingPathComponent("debug-0363d2.log").path
+            let payload: [String: Any] = [
+                "sessionId": "0363d2",
+                "runId": "post-fix",
+                "hypothesisId": "F",
+                "location": "MainViewModel.processFile:catch",
+                "message": "trim failed",
+                "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+                "data": [
+                    "file": file.fileName,
+                    "error": error.localizedDescription,
+                    "errorDebug": String(describing: error)
+                ] as [String: Any]
+            ]
+            if let json = try? JSONSerialization.data(withJSONObject: payload),
+               let line = String(data: json, encoding: .utf8) {
+                let entry = line + "\n"
+                for p in [path, folderLog] {
+                    let url = URL(fileURLWithPath: p)
+                    if FileManager.default.fileExists(atPath: p),
+                       let handle = try? FileHandle(forWritingTo: url) {
+                        defer { try? handle.close() }
+                        try? handle.seekToEnd()
+                        if let d = entry.data(using: .utf8) { try? handle.write(contentsOf: d) }
+                    } else {
+                        try? entry.write(to: url, atomically: true, encoding: .utf8)
+                    }
+                }
+                NSLog("[debug-0363d2] FAIL %@: %@", file.fileName, error.localizedDescription)
+            }
+            // #endregion
             return TrimResult(
                 success: false,
                 originalFile: file,
